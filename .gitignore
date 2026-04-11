@@ -1,0 +1,7 @@
+/bridge-agent
+dist/
+*.exe
+*.out
+.bridge-sessions.json
+agent.yaml
+.DS_Store

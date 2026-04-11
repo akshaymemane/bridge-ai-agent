@@ -1,0 +1,21 @@
+device:
+  id: my-device
+  name: My Device
+
+tools:
+  codex:
+    cmd: codex
+    args: ["exec", "--full-auto"]
+    continue_args: []
+    working_dir: .
+
+  claude:
+    cmd: claude
+    args: ["-p"]
+    continue_args: ["--continue", "-p"]
+    working_dir: .
+
+default_tool: codex
+
+gateway:
+  url: ws://100.x.x.x:8080/agent
