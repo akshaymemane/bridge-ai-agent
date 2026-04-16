@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -13,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -63,15 +66,20 @@ type ToolConfig struct {
 	Args         []string `yaml:"args"`          // args for the first message in a session, e.g. ["-p"]
 	ContinueArgs []string `yaml:"continue_args"` // args for follow-up messages, e.g. ["--continue", "-p"]
 	WorkingDir   string   `yaml:"working_dir"`   // optional cwd for the tool; relative paths resolve from the config file directory
+	FallbackTool string   `yaml:"fallback_tool"` // tool to try if this tool's binary is missing from PATH
+	Direct       bool     `yaml:"direct"`        // run the tool directly (capture stdout), skip tmux pane scanning
 }
 
 type Config struct {
 	Device struct {
-		ID   string `yaml:"id"`
-		Name string `yaml:"name"`
+		ID        string `yaml:"id"`
+		Name      string `yaml:"name"`
+		Hostname  string `yaml:"hostname"`
+		TailnetID string `yaml:"tailnet_id"`
 	} `yaml:"device"`
 	Tools       map[string]ToolConfig `yaml:"tools"`
 	DefaultTool string                `yaml:"default_tool"`
+	WorkingDir  string                `yaml:"working_dir"`
 	Gateway     struct {
 		URL string `yaml:"url"`
 	} `yaml:"gateway"`
@@ -92,14 +100,130 @@ func loadConfig(path string) (*Config, error) {
 	if err := yaml.NewDecoder(f).Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
-	if cfg.Device.ID == "" {
-		return nil, fmt.Errorf("config: device.id is required")
-	}
-	if cfg.Gateway.URL == "" {
-		return nil, fmt.Errorf("config: gateway.url is required")
-	}
 	cfg.BaseDir = filepath.Dir(absPath)
+	applyConfigDefaults(&cfg)
 	return &cfg, nil
+}
+
+func applyConfigDefaults(cfg *Config) {
+	detectedHostname, detectedTailnet := detectLocalIdentity()
+
+	cfg.Device.Hostname = firstNonEmpty(cfg.Device.Hostname, cfg.Device.Name, detectedHostname)
+	cfg.Device.Name = firstNonEmpty(cfg.Device.Name, cfg.Device.Hostname, "Device")
+	cfg.Device.TailnetID = firstNonEmpty(
+		cfg.Device.TailnetID,
+		os.Getenv("TAILSCALE_TAILNET"),
+		detectedTailnet,
+		"local",
+	)
+	if cfg.Device.ID == "" {
+		cfg.Device.ID = deriveDeviceID(cfg.Device.Hostname, cfg.Device.TailnetID)
+	}
+
+	cfg.Gateway.URL = firstNonEmpty(
+		cfg.Gateway.URL,
+		os.Getenv("BRIDGE_AGENT_GATEWAY_URL"),
+		os.Getenv("BRIDGE_GATEWAY_URL"),
+		"wss://bridgeai.dev/agent",
+	)
+
+	if cfg.Tools == nil {
+		cfg.Tools = autoToolConfigs(cfg.WorkingDir)
+	}
+	if cfg.WorkingDir != "" {
+		for name, tool := range cfg.Tools {
+			if tool.WorkingDir == "" {
+				tool.WorkingDir = cfg.WorkingDir
+				cfg.Tools[name] = tool
+			}
+		}
+	}
+	if cfg.DefaultTool == "" {
+		cfg.DefaultTool = preferredDefaultTool(cfg.Tools)
+	}
+}
+
+func detectLocalIdentity() (hostname string, tailnetID string) {
+	hostname, _ = os.Hostname()
+	hostname = strings.TrimSpace(hostname)
+
+	if envTailnet := os.Getenv("TAILSCALE_TAILNET"); envTailnet != "" {
+		return trimHostname(hostname), envTailnet
+	}
+
+	path, err := exec.LookPath("tailscale")
+	if err != nil {
+		return trimHostname(hostname), ""
+	}
+	output, err := exec.Command(path, "status", "--json").Output()
+	if err != nil {
+		return trimHostname(hostname), ""
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(output, &payload); err != nil {
+		return trimHostname(hostname), ""
+	}
+	self, _ := payload["Self"].(map[string]any)
+	dnsName := trimHostname(stringValue(self["DNSName"]))
+	selfHostname := trimHostname(firstNonEmpty(
+		stringValue(self["HostName"]),
+		stringValue(self["Hostname"]),
+		hostname,
+	))
+	tailnetID = tailnetFromDNSName(stringValue(self["DNSName"]))
+	return firstNonEmpty(selfHostname, dnsName, trimHostname(hostname), "device"), tailnetID
+}
+
+func tailnetFromDNSName(dnsName string) string {
+	dnsName = strings.TrimSuffix(strings.TrimSpace(dnsName), ".")
+	if dnsName == "" {
+		return ""
+	}
+	parts := strings.Split(dnsName, ".")
+	if len(parts) < 3 {
+		return ""
+	}
+	return strings.Join(parts[1:], ".")
+}
+
+func autoToolConfigs(workingDir string) map[string]ToolConfig {
+	tools := map[string]ToolConfig{}
+	if _, err := exec.LookPath("codex"); err == nil {
+		tools["codex"] = ToolConfig{
+			Cmd:        "codex",
+			Args:       []string{"exec", "--full-auto"},
+			WorkingDir: workingDir,
+		}
+	}
+	if _, err := exec.LookPath("claude"); err == nil {
+		tools["claude"] = ToolConfig{
+			Cmd:          "claude",
+			Args:         []string{"-p", "--dangerously-skip-permissions"},
+			ContinueArgs: []string{"--continue", "-p", "--dangerously-skip-permissions"},
+			WorkingDir:   workingDir,
+			Direct:       true,
+		}
+	}
+	if _, err := exec.LookPath("openclaw"); err == nil {
+		tools["openclaw"] = ToolConfig{
+			Cmd:        "openclaw",
+			WorkingDir: workingDir,
+		}
+	}
+	return tools
+}
+
+func preferredDefaultTool(tools map[string]ToolConfig) string {
+	for _, candidate := range []string{"codex", "claude", "openclaw"} {
+		if _, ok := tools[candidate]; ok {
+			return candidate
+		}
+	}
+	for name := range tools {
+		return name
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -107,21 +231,27 @@ func loadConfig(path string) (*Config, error) {
 // ---------------------------------------------------------------------------
 
 type InboundMsg struct {
-	Type   string `json:"type"`
-	ChatID string `json:"chat_id"`
-	Tool   string `json:"tool"`
-	Text   string `json:"text"`
+	Type     string `json:"type"`
+	ChatID   string `json:"chat_id"`
+	DeviceID string `json:"device_id,omitempty"`
+	UserID   string `json:"user_id,omitempty"`
+	Tool     string `json:"tool"`
+	Text     string `json:"text"`
 }
 
 type OutboundMsg struct {
-	Type     string `json:"type"`
-	ChatID   string `json:"chat_id,omitempty"`
-	DeviceID string `json:"device_id,omitempty"`
-	Name     string `json:"name,omitempty"`
-	Status   string `json:"status,omitempty"`
-	Text     string `json:"text,omitempty"`
-	Code     string `json:"code,omitempty"`
-	Message  string `json:"message,omitempty"`
+	Type      string   `json:"type"`
+	ChatID    string   `json:"chat_id,omitempty"`
+	DeviceID  string   `json:"device_id,omitempty"`
+	UserID    string   `json:"user_id,omitempty"`
+	Name      string   `json:"name,omitempty"`
+	Hostname  string   `json:"hostname,omitempty"`
+	TailnetID string   `json:"tailnet_id,omitempty"`
+	Status    string   `json:"status,omitempty"`
+	Text      string   `json:"text,omitempty"`
+	Code      string   `json:"code,omitempty"`
+	Message   string   `json:"message,omitempty"`
+	Tools     []string `json:"tools,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +370,70 @@ func tmuxCapturePane(session string) (string, error) {
 }
 
 // ---------------------------------------------------------------------------
+// Tool resolution with fallback chain
+// ---------------------------------------------------------------------------
+
+// resolveToolCfg walks the fallback chain for the requested tool name and
+// returns the first tool whose binary is reachable on PATH.
+//
+// Resolution order for each candidate:
+//  1. Look up in cfg.Tools. If missing, jump to cfg.DefaultTool.
+//  2. Check binary with exec.LookPath. If missing:
+//     a. Try ToolConfig.FallbackTool (if set and not yet visited).
+//     b. Try cfg.DefaultTool (if different and not yet visited).
+//
+// Cycle detection prevents infinite loops in misconfigured fallback chains.
+func resolveToolCfg(cfg *Config, requestedTool string) (name string, tc ToolConfig, err error) {
+	visited := make(map[string]bool)
+
+	current := requestedTool
+	if current == "" {
+		current = cfg.DefaultTool
+	}
+
+	for {
+		if visited[current] {
+			return "", ToolConfig{}, fmt.Errorf("tool fallback cycle detected at %q", current)
+		}
+		visited[current] = true
+
+		candidate, ok := cfg.Tools[current]
+		if !ok {
+			// Tool not configured — fall back to default if we haven't tried it.
+			if current != cfg.DefaultTool && cfg.DefaultTool != "" && !visited[cfg.DefaultTool] {
+				slog.Warn("tool not configured, trying default", "tool", current, "default", cfg.DefaultTool)
+				current = cfg.DefaultTool
+				continue
+			}
+			return "", ToolConfig{}, fmt.Errorf("tool not configured: %s", current)
+		}
+
+		if _, lookErr := exec.LookPath(candidate.Cmd); lookErr == nil {
+			if current != requestedTool && requestedTool != "" {
+				slog.Info("using fallback tool", "requested", requestedTool, "resolved", current)
+			}
+			return current, candidate, nil
+		}
+
+		// Binary missing — try per-tool fallback, then default.
+		if candidate.FallbackTool != "" && !visited[candidate.FallbackTool] {
+			slog.Warn("tool binary missing, trying fallback_tool",
+				"tool", current, "cmd", candidate.Cmd, "fallback", candidate.FallbackTool)
+			current = candidate.FallbackTool
+			continue
+		}
+		if current != cfg.DefaultTool && cfg.DefaultTool != "" && !visited[cfg.DefaultTool] {
+			slog.Warn("tool binary missing, trying default_tool",
+				"tool", current, "cmd", candidate.Cmd, "default", cfg.DefaultTool)
+			current = cfg.DefaultTool
+			continue
+		}
+
+		return "", ToolConfig{}, fmt.Errorf("tool binary not found: %s (cmd: %s)", current, candidate.Cmd)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Session processor — one goroutine per active send_message
 // ---------------------------------------------------------------------------
 
@@ -254,28 +448,19 @@ func tmuxCapturePane(session string) (string, error) {
 func processMessage(a *Agent, sendMsg func([]byte), msg InboundMsg) {
 	cfg := a.cfg
 	if !validChatID(msg.ChatID) {
-		sendErr(sendMsg, msg.ChatID, "session_error", "invalid chat_id: must match [a-z0-9_-]{1,64}")
+		sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "session_error", "invalid chat_id: must match [a-z0-9_-]{1,64}")
 		return
 	}
 
-	// Resolve tool.
-	toolName := msg.Tool
-	if toolName == "" {
-		toolName = cfg.DefaultTool
-	}
-	toolCfg, ok := cfg.Tools[toolName]
-	if !ok {
-		sendErr(sendMsg, msg.ChatID, "tool_not_found", "tool not configured: "+toolName)
+	// Resolve tool — walks fallback chain if requested tool is missing or binary not found.
+	resolvedTool, toolCfg, toolErr := resolveToolCfg(cfg, msg.Tool)
+	if toolErr != nil {
+		slog.Error("tool resolution failed", "requested", msg.Tool, "err", toolErr)
+		sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "tool_not_found", toolErr.Error())
 		return
 	}
+	slog.Info("tool resolved", "chat_id", msg.ChatID, "requested", msg.Tool, "resolved", resolvedTool)
 	workingDir := resolveWorkingDir(cfg.BaseDir, toolCfg.WorkingDir)
-
-	// Verify tool binary exists.
-	if _, err := exec.LookPath(toolCfg.Cmd); err != nil {
-		slog.Error("tool binary not found", "tool", toolName, "cmd", toolCfg.Cmd)
-		sendErr(sendMsg, msg.ChatID, "tool_not_found", "tool binary not found: "+toolCfg.Cmd)
-		return
-	}
 
 	session := tmuxSessionName(msg.ChatID)
 
@@ -284,7 +469,7 @@ func processMessage(a *Agent, sendMsg func([]byte), msg InboundMsg) {
 	if !tmuxHasSession(session) {
 		if err := tmuxNewSession(session, workingDir); err != nil {
 			slog.Error("failed to create tmux session", "session", session, "err", err)
-			sendErr(sendMsg, msg.ChatID, "session_error", "failed to create tmux session: "+err.Error())
+			sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "session_error", "failed to create tmux session: "+err.Error())
 			return
 		}
 		slog.Info("created tmux session", "session", session)
@@ -295,7 +480,7 @@ func processMessage(a *Agent, sendMsg func([]byte), msg InboundMsg) {
 	msgFile := fmt.Sprintf("/tmp/bridge_msg_%s", msg.ChatID)
 	if err := os.WriteFile(msgFile, []byte(msg.Text), 0600); err != nil {
 		slog.Error("failed to write message temp file", "err", err)
-		sendErr(sendMsg, msg.ChatID, "session_error", "failed to write message file: "+err.Error())
+		sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "session_error", "failed to write message file: "+err.Error())
 		return
 	}
 
@@ -304,6 +489,40 @@ func processMessage(a *Agent, sendMsg func([]byte), msg InboundMsg) {
 	invocationArgs := toolCfg.Args
 	if !isFirst && len(toolCfg.ContinueArgs) > 0 {
 		invocationArgs = toolCfg.ContinueArgs
+	}
+
+	// Direct mode: run the tool as a subprocess and capture stdout.
+	// Use this for one-shot CLIs (e.g. claude -p) that don't need a persistent
+	// shell session. Avoids the tmux pane-scanning approach, which breaks when
+	// the response fits within the pane's fixed row height (no scrollback growth).
+	if toolCfg.Direct {
+		ctx, cancel := context.WithTimeout(context.Background(), sessionTimeout)
+		defer cancel()
+
+		stdout, stderr, err := runDirectTool(ctx, toolCfg.Cmd, invocationArgs, msg.Text, workingDir)
+		if err != nil {
+			errMsg := strings.TrimSpace(stderr)
+			if errMsg == "" {
+				errMsg = strings.TrimSpace(stdout)
+			}
+			if errMsg == "" {
+				errMsg = err.Error()
+			}
+			slog.Error("direct tool run failed", "tool", resolvedTool, "chat_id", msg.ChatID, "err", errMsg)
+			sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "session_error", errMsg)
+			sendStreamEnd(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID)
+			return
+		}
+		text := strings.TrimSpace(stdout)
+		if text == "" {
+			text = strings.TrimSpace(stderr)
+		}
+		if text != "" {
+			sendChunk(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, text)
+		}
+		sendStreamEnd(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID)
+		slog.Info("direct tool run complete", "tool", resolvedTool, "chat_id", msg.ChatID)
+		return
 	}
 
 	outputFile := ""
@@ -321,11 +540,11 @@ func processMessage(a *Agent, sendMsg func([]byte), msg InboundMsg) {
 		if readErr == nil {
 			text := strings.TrimSpace(string(content))
 			if text != "" {
-				sendChunk(sendMsg, msg.ChatID, text)
+				sendChunk(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, text)
 			} else if strings.TrimSpace(stdout) != "" {
-				sendChunk(sendMsg, msg.ChatID, strings.TrimSpace(stdout))
+				sendChunk(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, strings.TrimSpace(stdout))
 			}
-			sendStreamEnd(sendMsg, msg.ChatID)
+			sendStreamEnd(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID)
 			slog.Info("direct codex run complete", "chat_id", msg.ChatID)
 			return
 		}
@@ -338,8 +557,8 @@ func processMessage(a *Agent, sendMsg func([]byte), msg InboundMsg) {
 			if msgText == "" {
 				msgText = err.Error()
 			}
-			sendErr(sendMsg, msg.ChatID, "session_error", msgText)
-			sendStreamEnd(sendMsg, msg.ChatID)
+			sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "session_error", msgText)
+			sendStreamEnd(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID)
 			return
 		}
 
@@ -348,9 +567,9 @@ func processMessage(a *Agent, sendMsg func([]byte), msg InboundMsg) {
 			fallback = strings.TrimSpace(stderr)
 		}
 		if fallback != "" {
-			sendChunk(sendMsg, msg.ChatID, fallback)
+			sendChunk(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, fallback)
 		}
-		sendStreamEnd(sendMsg, msg.ChatID)
+		sendStreamEnd(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID)
 		slog.Warn("codex output file missing, used stdout fallback", "chat_id", msg.ChatID, "path", outputFile)
 		return
 	}
@@ -370,14 +589,14 @@ func processMessage(a *Agent, sendMsg func([]byte), msg InboundMsg) {
 	// Send the tool invocation command to the shell.
 	if err := tmuxSendKeys(session, scriptLine); err != nil {
 		slog.Error("failed to send tool command to tmux", "session", session, "err", err)
-		sendErr(sendMsg, msg.ChatID, "session_error", "failed to send command: "+err.Error())
+		sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "session_error", "failed to send command: "+err.Error())
 		return
 	}
 
 	// Send sentinel — runs in the shell AFTER the tool exits.
 	if err := tmuxSendSentinel(session); err != nil {
 		slog.Error("failed to send sentinel", "session", session, "err", err)
-		sendErr(sendMsg, msg.ChatID, "session_error", "failed to send sentinel: "+err.Error())
+		sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "session_error", "failed to send sentinel: "+err.Error())
 		return
 	}
 
@@ -404,13 +623,13 @@ func processMessage(a *Agent, sendMsg func([]byte), msg InboundMsg) {
 		select {
 		case <-ctx.Done():
 			slog.Warn("session timed out waiting for sentinel", "session", session)
-			sendErr(sendMsg, msg.ChatID, "session_error", "response timed out")
+			sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "session_error", "response timed out")
 			return
 		case <-ticker.C:
 			raw, err := tmuxCapturePane(session)
 			if err != nil {
 				slog.Warn("capture-pane error", "session", session, "err", err)
-				sendErr(sendMsg, msg.ChatID, "session_error", "capture-pane failed: "+err.Error())
+				sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "session_error", "capture-pane failed: "+err.Error())
 				return
 			}
 
@@ -433,55 +652,38 @@ func processMessage(a *Agent, sendMsg func([]byte), msg InboundMsg) {
 				// No sentinel yet — stream new content, preserving newlines so
 				// the frontend can reconstruct line boundaries correctly.
 				if newContent != "" {
-					sendChunk(sendMsg, msg.ChatID, newContent)
+					sendChunk(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, newContent)
 				}
 				lastLineCount = len(lines)
 				continue
 			}
 
-				// Sentinel found — stream everything before it (trim only trailing
-				// whitespace at the very end of the response), then end.
-				if outputFile != "" {
-					content, readErr := os.ReadFile(outputFile)
-					_ = os.Remove(outputFile)
-					if readErr == nil {
-						text := strings.TrimRight(string(content), "\n ")
-						if text != "" {
-							sendChunk(sendMsg, msg.ChatID, text)
-						}
-						sendStreamEnd(sendMsg, msg.ChatID)
-						slog.Info("stream complete from tool output file", "chat_id", msg.ChatID, "session", session)
-						return
-					}
-					slog.Warn("failed to read tool output file, falling back to pane capture", "chat_id", msg.ChatID, "path", outputFile, "err", readErr)
-				}
-
-				before := strings.TrimRight(newContent[:sentinelIdx], "\n ")
-				if before != "" {
-					sendChunk(sendMsg, msg.ChatID, before)
-				}
-			sendStreamEnd(sendMsg, msg.ChatID)
+			// Sentinel found — emit everything before it, then end stream.
+			before := strings.TrimRight(newContent[:sentinelIdx], "\n ")
+			if before != "" {
+				sendChunk(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, before)
+			}
+			sendStreamEnd(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID)
 			slog.Info("stream complete", "chat_id", msg.ChatID, "session", session)
 			return
 		}
 	}
 }
 
-
-func sendChunk(send func([]byte), chatID, text string) {
-	msg := OutboundMsg{Type: "stream_chunk", ChatID: chatID, Text: text}
+func sendChunk(send func([]byte), deviceID, userID, chatID, text string) {
+	msg := OutboundMsg{Type: "stream_chunk", DeviceID: deviceID, UserID: userID, ChatID: chatID, Text: text}
 	data, _ := json.Marshal(msg)
 	send(data)
 }
 
-func sendStreamEnd(send func([]byte), chatID string) {
-	msg := OutboundMsg{Type: "stream_end", ChatID: chatID}
+func sendStreamEnd(send func([]byte), deviceID, userID, chatID string) {
+	msg := OutboundMsg{Type: "stream_end", DeviceID: deviceID, UserID: userID, ChatID: chatID}
 	data, _ := json.Marshal(msg)
 	send(data)
 }
 
-func sendErr(send func([]byte), chatID, code, message string) {
-	msg := OutboundMsg{Type: "error", ChatID: chatID, Code: code, Message: message}
+func sendErr(send func([]byte), deviceID, userID, chatID, code, message string) {
+	msg := OutboundMsg{Type: "error", DeviceID: deviceID, UserID: userID, ChatID: chatID, Code: code, Message: message}
 	data, _ := json.Marshal(msg)
 	send(data)
 	slog.Warn("sending error to gateway", "chat_id", chatID, "code", code, "message", message)
@@ -492,8 +694,9 @@ func sendErr(send func([]byte), chatID, code, message string) {
 // ---------------------------------------------------------------------------
 
 type Agent struct {
-	cfg    *Config
-	sendCh chan []byte
+	cfg          *Config
+	sendCh       chan []byte
+	capabilities []string
 
 	// sessionsMu guards sessions and statePath.
 	sessionsMu sync.Mutex
@@ -512,10 +715,11 @@ func newAgent(cfg *Config) *Agent {
 		slog.Info("loaded persisted session state", "sessions", loaded, "path", statePath)
 	}
 	return &Agent{
-		cfg:       cfg,
-		sendCh:    make(chan []byte, 256),
-		sessions:  state.Sessions,
-		statePath: statePath,
+		cfg:          cfg,
+		sendCh:       make(chan []byte, 256),
+		capabilities: detectToolCapabilities(cfg),
+		sessions:     state.Sessions,
+		statePath:    statePath,
 	}
 }
 
@@ -585,10 +789,13 @@ func (a *Agent) connect() error {
 
 	// Send device_status online immediately.
 	regMsg := OutboundMsg{
-		Type:     "device_status",
-		DeviceID: a.cfg.Device.ID,
-		Name:     a.cfg.Device.Name,
-		Status:   "online",
+		Type:      "device_status",
+		DeviceID:  a.cfg.Device.ID,
+		Name:      a.cfg.Device.Name,
+		Hostname:  a.cfg.Device.Hostname,
+		TailnetID: a.cfg.Device.TailnetID,
+		Status:    "online",
+		Tools:     a.capabilities,
 	}
 	regData, _ := json.Marshal(regMsg)
 	if err := conn.WriteMessage(websocket.TextMessage, regData); err != nil {
@@ -678,7 +885,87 @@ func checkTools(cfg *Config) map[string]error {
 	return missing
 }
 
+func detectToolCapabilities(cfg *Config) []string {
+	seen := map[string]struct{}{}
+	out := []string{}
 
+	addIfPresent := func(name, cmd string) {
+		if _, ok := seen[name]; ok {
+			return
+		}
+		if _, err := exec.LookPath(cmd); err != nil {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
+
+	for name, tool := range cfg.Tools {
+		addIfPresent(name, firstNonEmpty(tool.Cmd, name))
+	}
+	for _, name := range []string{"claude", "codex", "ollama", "openclaw"} {
+		addIfPresent(name, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func stringValue(value any) string {
+	if raw, ok := value.(string); ok {
+		return strings.TrimSpace(raw)
+	}
+	return ""
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func trimHostname(value string) string {
+	value = strings.TrimSuffix(strings.TrimSpace(value), ".")
+	if idx := strings.Index(value, "."); idx > 0 {
+		return value[:idx]
+	}
+	return value
+}
+
+func deriveDeviceID(hostname, tailnetID string) string {
+	host := trimHostname(hostname)
+	if host == "" {
+		host = "device"
+	}
+	slug := slugify(host)
+	sum := sha1.Sum([]byte(strings.ToLower(host) + "|" + strings.ToLower(tailnetID)))
+	return slug + "-" + hex.EncodeToString(sum[:4])
+}
+
+func slugify(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	var b strings.Builder
+	prevDash := false
+	for _, r := range value {
+		isAlphaNum := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if isAlphaNum {
+			b.WriteRune(r)
+			prevDash = false
+			continue
+		}
+		if !prevDash && b.Len() > 0 {
+			b.WriteByte('-')
+			prevDash = true
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "device"
+	}
+	return out
+}
 
 // ---------------------------------------------------------------------------
 // main

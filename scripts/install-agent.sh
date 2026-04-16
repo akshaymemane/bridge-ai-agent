@@ -1,22 +1,36 @@
 #!/usr/bin/env bash
 # install-agent.sh — set up bridge-agent on this device.
 #
-# Usage (from the extracted release tarball directory):
+# Usage:
 #   bash install-agent.sh
 #
 # What it does:
 #   1. Creates agent.yaml from agent.yaml.example if not already present.
-#   2. Interactively fills in device.id, device.name, and gateway.url.
+#   2. Uses zero-config defaults for device identity and gateway routing.
 #   3. Verifies tmux is installed.
 #   4. Optionally installs bridge-agent as a startup service
 #      (launchd on macOS, systemd on Linux).
+#
+# This works both from:
+#   - an extracted release directory, where bridge-agent sits beside this script
+#   - a package-manager install, where bridge-agent is on PATH and config lives in ~/.bridge-agent
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AGENT_BIN="$SCRIPT_DIR/bridge-agent"
-EXAMPLE_YAML="$SCRIPT_DIR/agent.yaml.example"
-AGENT_YAML="$SCRIPT_DIR/agent.yaml"
+DEFAULT_AGENT_HOME="$SCRIPT_DIR"
+
+if [[ -f "$SCRIPT_DIR/bridge-agent" ]]; then
+  DEFAULT_AGENT_BIN="$SCRIPT_DIR/bridge-agent"
+else
+  DEFAULT_AGENT_BIN="$(command -v bridge-agent || true)"
+  DEFAULT_AGENT_HOME="$HOME/.bridge-agent"
+fi
+
+AGENT_HOME="${BRIDGE_AGENT_HOME:-$DEFAULT_AGENT_HOME}"
+AGENT_BIN="${BRIDGE_AGENT_BIN:-$DEFAULT_AGENT_BIN}"
+EXAMPLE_YAML="${BRIDGE_AGENT_EXAMPLE:-$SCRIPT_DIR/agent.yaml.example}"
+AGENT_YAML="${BRIDGE_AGENT_CONFIG:-$AGENT_HOME/agent.yaml}"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -27,17 +41,14 @@ success() { printf '\033[0;32m[bridge-agent]\033[0m %s\n' "$*"; }
 warn()    { printf '\033[0;33m[bridge-agent]\033[0m %s\n' "$*"; }
 err()     { printf '\033[0;31m[bridge-agent]\033[0m %s\n' "$*" >&2; }
 
-prompt() {
-  local label="$1"
-  local default="${2:-}"
-  local value
-  if [[ -n "$default" ]]; then
-    read -r -p "  $label [$default]: " value
-    echo "${value:-$default}"
-  else
-    read -r -p "  $label: " value
-    echo "$value"
-  fi
+detect_default_tool() {
+  for tool in codex claude openclaw; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      echo "$tool"
+      return
+    fi
+  done
+  echo "codex"
 }
 
 # ---------------------------------------------------------------------------
@@ -124,13 +135,14 @@ EOF
 info "Starting bridge-agent installer"
 echo
 
-if [[ ! -f "$AGENT_BIN" ]]; then
-  err "bridge-agent binary not found at $AGENT_BIN"
-  err "Make sure you are running this script from the extracted release directory."
+if [[ -z "$AGENT_BIN" || ! -f "$AGENT_BIN" ]]; then
+  err "bridge-agent binary not found."
+  err "Expected either a local ./bridge-agent beside this installer or bridge-agent on PATH."
   exit 1
 fi
 
 chmod +x "$AGENT_BIN"
+mkdir -p "$AGENT_HOME"
 
 # Check tmux.
 if ! command -v tmux &>/dev/null; then
@@ -164,26 +176,22 @@ else
     exit 1
   fi
 
-  info "Creating agent.yaml..."
-  echo
-
-  HOSTNAME_DEFAULT="$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr ' ' '-' || echo "my-device")"
-  DEVICE_ID="$(prompt "device.id  (unique, lowercase, no spaces)" "$HOSTNAME_DEFAULT")"
-  DEVICE_NAME="$(prompt "device.name  (display name shown in UI)" "$(hostname -s 2>/dev/null || echo 'My Device')")"
-  GATEWAY_URL="$(prompt "gateway.url  (e.g. ws://100.x.x.x:8080/agent)")"
-
-  if [[ -z "$GATEWAY_URL" ]]; then
-    err "gateway.url is required."
-    exit 1
-  fi
+  info "Creating agent.yaml with zero-config defaults..."
+  DEFAULT_TOOL="$(detect_default_tool)"
+  DEFAULT_GATEWAY_URL="${BRIDGE_AGENT_GATEWAY_URL:-${BRIDGE_GATEWAY_URL:-wss://bridgeai.dev/agent}}"
 
   cp "$EXAMPLE_YAML" "$AGENT_YAML"
-  sed -i.bak "s|^  id: .*|  id: $DEVICE_ID|" "$AGENT_YAML"
-  sed -i.bak "s|^  name: .*|  name: $DEVICE_NAME|" "$AGENT_YAML"
-  sed -i.bak "s|^  url: .*|  url: $GATEWAY_URL|" "$AGENT_YAML"
+  sed -i.bak "s|^default_tool: .*|default_tool: $DEFAULT_TOOL|" "$AGENT_YAML"
   rm -f "$AGENT_YAML.bak"
 
+  if ! grep -q '^gateway:$' "$AGENT_YAML"; then
+    printf '\n# Optional explicit gateway override.\ngateway:\n  url: %s\n' "$DEFAULT_GATEWAY_URL" >> "$AGENT_YAML"
+  fi
+
   success "Created $AGENT_YAML"
+  info "Default tool: $DEFAULT_TOOL"
+  info "Gateway URL:  $DEFAULT_GATEWAY_URL"
+  info "Device identity will be derived automatically from hostname and tailnet."
   CREATED_CONFIG=true
 fi
 echo
@@ -212,7 +220,7 @@ info "To start the agent now:"
 echo "    $AGENT_BIN -config $AGENT_YAML"
 echo
 if [[ "$CREATED_CONFIG" == "true" ]]; then
-  info "Review agent.yaml before starting — set the correct 'cmd' and 'args'"
-  info "for your installed AI CLI (claude, codex, ollama, etc.)."
+  info "Review agent.yaml if you want to override the default tool, working directory,"
+  info "or gateway URL. Device identity and tool badges will auto-register on startup."
   echo "    $AGENT_YAML"
 fi

@@ -26,6 +26,8 @@ build_target() {
   cat > "$stage_dir/README.md" <<EOF
 # bridge-agent $VERSION
 
+This release contains the BridgeAIChat device agent.
+
 ## Quick Setup
 
 Extract the archive and run the installer:

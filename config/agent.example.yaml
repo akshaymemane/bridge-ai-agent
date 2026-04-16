@@ -1,21 +1,40 @@
-device:
-  id: my-device
-  name: My Device
-
-tools:
-  codex:
-    cmd: codex
-    args: ["exec", "--full-auto"]
-    continue_args: []
-    working_dir: .
-
-  claude:
-    cmd: claude
-    args: ["-p"]
-    continue_args: ["--continue", "-p"]
-    working_dir: .
+# Bridge Agent configuration example.
+#
+# Device identity and gateway URL are now auto-derived when omitted:
+# - device.id      -> hostname + tailnet hash
+# - device.name    -> hostname
+# - device.tailnet -> detected from `tailscale status --json` when available
+# - gateway.url    -> $BRIDGE_AGENT_GATEWAY_URL, $BRIDGE_GATEWAY_URL, or
+#                     the SaaS default `wss://bridgeai.dev/agent`
+#
+# You can keep this file minimal and only override the pieces you care about.
 
 default_tool: codex
+working_dir: .
 
-gateway:
-  url: ws://100.x.x.x:8080/agent
+# Optional explicit overrides.
+# device:
+#   id: my-laptop-ab12cd34
+#   name: My Laptop
+#   tailnet_id: example.ts.net
+
+# Optional explicit gateway override.
+# gateway:
+#   url: ws://100.x.x.x:8080/agent
+
+# Optional explicit tool definitions.
+# If omitted, the agent auto-detects common CLIs such as codex, claude,
+# and openclaw on PATH and configures sensible defaults for them.
+#
+# tools:
+#   codex:
+#     cmd: codex
+#     args: ["exec", "--full-auto"]
+#     continue_args: []
+#     working_dir: .
+#
+#   claude:
+#     cmd: claude
+#     args: ["-p", "--dangerously-skip-permissions"]
+#     continue_args: ["--continue", "-p", "--dangerously-skip-permissions"]
+#     direct: true
