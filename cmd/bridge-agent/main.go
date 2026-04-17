@@ -301,6 +301,166 @@ func runDirectTool(ctx context.Context, cmdPath string, args []string, prompt st
 	return stdout.String(), stderr.String(), err
 }
 
+const helperToolName = "bridge"
+
+var (
+	helperListRe = regexp.MustCompile(`(?i)^(?:ls|list files|show files)(?:\s+(.+))?$`)
+	helperReadRe = regexp.MustCompile(`(?i)^(?:cat|read file|show file)\s+(.+)$`)
+	helperTailRe = regexp.MustCompile(`(?i)^(?:tail|logs|show logs)\s+(.+)$`)
+)
+
+func isHelperTool(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), helperToolName)
+}
+
+func helperWorkingDir(cfg *Config) string {
+	if dir := resolveWorkingDir(cfg.BaseDir, cfg.WorkingDir); dir != "" {
+		return dir
+	}
+	return cfg.BaseDir
+}
+
+func helperResolvePath(baseDir, raw string) string {
+	target := strings.TrimSpace(raw)
+	if target == "" {
+		return baseDir
+	}
+	if filepath.IsAbs(target) {
+		return filepath.Clean(target)
+	}
+	return filepath.Clean(filepath.Join(baseDir, target))
+}
+
+func runCommandOutput(ctx context.Context, workingDir, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	if workingDir != "" {
+		cmd.Dir = workingDir
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = strings.TrimSpace(stdout.String())
+		}
+		if msg == "" {
+			msg = err.Error()
+		}
+		return "", fmt.Errorf("%s %s: %s", name, strings.Join(args, " "), msg)
+	}
+	out := strings.TrimSpace(stdout.String())
+	if out == "" {
+		out = strings.TrimSpace(stderr.String())
+	}
+	return out, nil
+}
+
+func helperHelpText() string {
+	return strings.Join([]string{
+		"Bridge Helper handles a few safe remote checks directly.",
+		"",
+		"Try commands like:",
+		"- status",
+		"- pwd",
+		"- ls",
+		"- ls <path>",
+		"- read file <path>",
+		"- tail <path>",
+		"- processes",
+		"",
+		"For open-ended reasoning or coding tasks, switch to Codex or Claude in the app header.",
+	}, "\n")
+}
+
+func helperStatusText(cfg *Config, capabilities []string, workingDir string) string {
+	lines := []string{
+		fmt.Sprintf("Device: %s", cfg.Device.Name),
+		fmt.Sprintf("Device ID: %s", cfg.Device.ID),
+		fmt.Sprintf("Tailnet: %s", cfg.Device.TailnetID),
+		fmt.Sprintf("Gateway: %s", cfg.Gateway.URL),
+		fmt.Sprintf("Working directory: %s", workingDir),
+	}
+	if len(capabilities) > 0 {
+		lines = append(lines, fmt.Sprintf("Available tools: %s", strings.Join(capabilities, ", ")))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func helperReadFile(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s is a directory", path)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	text := string(content)
+	if len(text) > 24*1024 {
+		text = text[:24*1024] + "\n\n[truncated]"
+	}
+	return text, nil
+}
+
+func runHelperPrompt(cfg *Config, capabilities []string, prompt string) (string, error) {
+	workingDir := helperWorkingDir(cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	raw := strings.TrimSpace(prompt)
+	lower := strings.ToLower(raw)
+
+	switch {
+	case raw == "", lower == "help", strings.Contains(lower, "what can you do"):
+		return helperHelpText(), nil
+	case lower == "status", strings.Contains(lower, "device status"):
+		return helperStatusText(cfg, capabilities, workingDir), nil
+	case lower == "pwd", strings.Contains(lower, "where am i"), strings.Contains(lower, "current directory"):
+		return workingDir, nil
+	case helperListRe.MatchString(raw):
+		matches := helperListRe.FindStringSubmatch(raw)
+		target := "."
+		if len(matches) > 1 && strings.TrimSpace(matches[1]) != "" {
+			target = matches[1]
+		}
+		resolved := helperResolvePath(workingDir, target)
+		out, err := runCommandOutput(ctx, workingDir, "ls", "-la", resolved)
+		if err != nil {
+			return "", err
+		}
+		return out, nil
+	case helperReadRe.MatchString(raw):
+		matches := helperReadRe.FindStringSubmatch(raw)
+		resolved := helperResolvePath(workingDir, matches[1])
+		out, err := helperReadFile(resolved)
+		if err != nil {
+			return "", err
+		}
+		return out, nil
+	case helperTailRe.MatchString(raw):
+		matches := helperTailRe.FindStringSubmatch(raw)
+		resolved := helperResolvePath(workingDir, matches[1])
+		out, err := runCommandOutput(ctx, workingDir, "tail", "-n", "80", resolved)
+		if err != nil {
+			return "", err
+		}
+		return out, nil
+	case lower == "ps", lower == "processes", lower == "show processes", lower == "list processes":
+		out, err := runCommandOutput(ctx, workingDir, "ps", "-eo", "pid,ppid,%cpu,%mem,comm", "--sort=-%cpu")
+		if err != nil {
+			return "", err
+		}
+		return out, nil
+	default:
+		return helperHelpText(), nil
+	}
+}
+
 // ---------------------------------------------------------------------------
 // tmux helpers — all use exec.Command, never shell interpolation
 // ---------------------------------------------------------------------------
@@ -452,14 +612,31 @@ func processMessage(a *Agent, sendMsg func([]byte), msg InboundMsg) {
 		return
 	}
 
+	requestedTool := strings.TrimSpace(msg.Tool)
+	if requestedTool == "" {
+		requestedTool = cfg.DefaultTool
+	}
+	if isHelperTool(requestedTool) {
+		text, err := runHelperPrompt(cfg, a.capabilities, msg.Text)
+		if err != nil {
+			sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "session_error", err.Error())
+			sendStreamEnd(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID)
+			return
+		}
+		sendChunk(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, text)
+		sendStreamEnd(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID)
+		slog.Info("bridge helper handled message", "chat_id", msg.ChatID)
+		return
+	}
+
 	// Resolve tool — walks fallback chain if requested tool is missing or binary not found.
-	resolvedTool, toolCfg, toolErr := resolveToolCfg(cfg, msg.Tool)
+	resolvedTool, toolCfg, toolErr := resolveToolCfg(cfg, requestedTool)
 	if toolErr != nil {
-		slog.Error("tool resolution failed", "requested", msg.Tool, "err", toolErr)
+		slog.Error("tool resolution failed", "requested", requestedTool, "err", toolErr)
 		sendErr(sendMsg, a.cfg.Device.ID, msg.UserID, msg.ChatID, "tool_not_found", toolErr.Error())
 		return
 	}
-	slog.Info("tool resolved", "chat_id", msg.ChatID, "requested", msg.Tool, "resolved", resolvedTool)
+	slog.Info("tool resolved", "chat_id", msg.ChatID, "requested", requestedTool, "resolved", resolvedTool)
 	workingDir := resolveWorkingDir(cfg.BaseDir, toolCfg.WorkingDir)
 
 	session := tmuxSessionName(msg.ChatID)
@@ -899,6 +1076,9 @@ func detectToolCapabilities(cfg *Config) []string {
 		seen[name] = struct{}{}
 		out = append(out, name)
 	}
+
+	seen[helperToolName] = struct{}{}
+	out = append(out, helperToolName)
 
 	for name, tool := range cfg.Tools {
 		addIfPresent(name, firstNonEmpty(tool.Cmd, name))

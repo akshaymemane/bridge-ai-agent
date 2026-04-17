@@ -25,6 +25,7 @@ The config can stay minimal:
 - `device.id`, `device.name`, and `device.tailnet_id` auto-derive from hostname and Tailscale when omitted
 - `gateway.url` falls back to `BRIDGE_AGENT_GATEWAY_URL`, `BRIDGE_GATEWAY_URL`, or `wss://bridgeai.dev/agent`
 - tool definitions auto-detect common CLIs on `PATH` when omitted
+- the built-in `bridge` helper is always available for safe read-only remote checks
 
 ## Run
 
@@ -48,6 +49,21 @@ tools:
 ```
 
 Direct mode bypasses tmux and avoids pane-capture timeouts for tools like Claude.
+
+## Bridge Helper
+
+Every connected agent also exposes a built-in `bridge` helper tool for simple remote inspection tasks without invoking an AI CLI.
+
+Try prompts like:
+
+- `status`
+- `pwd`
+- `ls`
+- `read file /path/to/file`
+- `tail /path/to/log`
+- `processes`
+
+Use Codex or Claude for open-ended reasoning and coding tasks. Use `bridge` when you want quick, safe, read-only device checks from the chat UI.
 
 ## Session Model
 
